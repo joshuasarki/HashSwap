@@ -190,10 +190,11 @@
   )
 )
 
-;; IMPROVEMENT 1: Fixed claim function - now transfers from contract
+;; CRITICAL FIX: Fixed claim function - now properly transfers from contract to claimer
 (define-public (claim (preimage (buff 32)))
   (let (
     (hash (sha256 preimage))
+    (claimer tx-sender) ;; Capture the claimer's address before as-contract
   )
     (match (map-get? swaps hash)
       swap-data
@@ -204,15 +205,15 @@
         ;; Recipient match check if specified
         (let ((recipient-opt (get recipient swap-data)))
           (if (is-some recipient-opt)
-            (asserts! (is-eq tx-sender (unwrap! recipient-opt ERR_NOT_RECIPIENT)) ERR_NOT_RECIPIENT)
+            (asserts! (is-eq claimer (unwrap! recipient-opt ERR_NOT_RECIPIENT)) ERR_NOT_RECIPIENT)
             true
           )
         )
         
         ;; For backward compatibility, claim the full remaining amount
         (let ((claim-amount (get remaining-amount swap-data)))
-          ;; CRITICAL FIX: Transfer from contract to claimer
-          (try! (as-contract (stx-transfer? claim-amount tx-sender tx-sender)))
+          ;; CRITICAL FIX: Transfer from contract to claimer using captured address
+          (try! (as-contract (stx-transfer? claim-amount tx-sender claimer)))
           
           ;; Update swap status
           (map-set swaps hash (merge swap-data { 
@@ -225,21 +226,24 @@
           ;; Record claim history
           (map-insert claim-history 
             {hash: hash, claim-id: u1}
-            {claimer: tx-sender, amount: claim-amount, timestamp: stacks-block-height}
+            {claimer: claimer, amount: claim-amount, timestamp: stacks-block-height}
           )
+          
+          (print {event: "swap-claimed", hash: hash, recipient: claimer, amount: claim-amount})
+          (ok true)
         )
-        
-        (print {event: "swap-claimed", hash: hash, recipient: tx-sender})
-        (ok true)
       )
       ERR_INVALID_PREIMAGE
     )
   )
 )
 
-;; IMPROVEMENT 3: Partial claim function - FIXED variable scope issue
+;; CRITICAL FIX: Fixed partial-claim function - now properly transfers from contract to claimer
 (define-public (partial-claim (preimage (buff 32)) (claim-amount uint))
-  (let ((hash (sha256 preimage)))
+  (let (
+    (hash (sha256 preimage))
+    (claimer tx-sender) ;; Capture the claimer's address before as-contract
+  )
     (match (map-get? swaps hash)
       swap-data
       (begin
@@ -251,12 +255,12 @@
         
         ;; Recipient validation
         (match (get recipient swap-data)
-          some-recipient (asserts! (is-eq tx-sender some-recipient) ERR_NOT_RECIPIENT)
+          some-recipient (asserts! (is-eq claimer some-recipient) ERR_NOT_RECIPIENT)
           true
         )
         
-        ;; Transfer claimed amount from contract
-        (try! (as-contract (stx-transfer? claim-amount tx-sender tx-sender)))
+        ;; CRITICAL FIX: Transfer claimed amount from contract to claimer using captured address
+        (try! (as-contract (stx-transfer? claim-amount tx-sender claimer)))
         
         ;; Update swap data
         (let (
@@ -274,11 +278,10 @@
           ;; Record claim history
           (map-insert claim-history 
             {hash: hash, claim-id: new-claim-count}
-            {claimer: tx-sender, amount: claim-amount, timestamp: stacks-block-height}
+            {claimer: claimer, amount: claim-amount, timestamp: stacks-block-height}
           )
           
-          ;; FIXED: Move print statement inside let block where new-remaining is defined
-          (print {event: "partial-claim", hash: hash, amount: claim-amount, remaining: new-remaining})
+          (print {event: "partial-claim", hash: hash, amount: claim-amount, remaining: new-remaining, claimer: claimer})
           (ok true)
         )
       )
@@ -287,62 +290,66 @@
   )
 )
 
-;; IMPROVEMENT 1: Fixed refund function - now transfers from contract
+;; CRITICAL FIX: Fixed refund function - now properly transfers from contract to sender
 (define-public (refund (hash-secret (buff 32)))
-  (match (map-get? swaps hash-secret)
-    swap-data
-    (begin
-      (try! (assert-not-paused))
-      (asserts! (is-eq (get status swap-data) "open") ERR_SWAP_NOT_OPEN)
-      (asserts! (>= stacks-block-height (get timeout swap-data)) ERR_TOO_EARLY)
-      (asserts! (is-eq tx-sender (get sender swap-data)) ERR_NOT_SENDER)
-      
-      ;; CRITICAL FIX: Transfer remaining amount from contract back to sender
-      (let ((refund-amount (get remaining-amount swap-data)))
-        (try! (as-contract (stx-transfer? refund-amount tx-sender (get sender swap-data))))
+  (let ((refunder tx-sender)) ;; Capture the refunder's address before as-contract
+    (match (map-get? swaps hash-secret)
+      swap-data
+      (begin
+        (try! (assert-not-paused))
+        (asserts! (is-eq (get status swap-data) "open") ERR_SWAP_NOT_OPEN)
+        (asserts! (>= stacks-block-height (get timeout swap-data)) ERR_TOO_EARLY)
+        (asserts! (is-eq refunder (get sender swap-data)) ERR_NOT_SENDER)
         
-        (map-set swaps hash-secret (merge swap-data { 
-          status: "refunded",
-          remaining-amount: u0,
-          last-activity: stacks-block-height
-        }))
+        ;; CRITICAL FIX: Transfer remaining amount from contract back to sender
+        (let ((refund-amount (get remaining-amount swap-data)))
+          (try! (as-contract (stx-transfer? refund-amount tx-sender (get sender swap-data))))
+          
+          (map-set swaps hash-secret (merge swap-data { 
+            status: "refunded",
+            remaining-amount: u0,
+            last-activity: stacks-block-height
+          }))
+          
+          (print {event: "swap-refunded", hash: hash-secret, sender: refunder, amount: refund-amount})
+          (ok true)
+        )
       )
-      
-      (print {event: "swap-refunded", hash: hash-secret, sender: tx-sender})
-      (ok true)
+      ERR_SWAP_NOT_FOUND
     )
-    ERR_SWAP_NOT_FOUND
   )
 )
 
-;; IMPROVEMENT 3: Emergency recovery for very old swaps
+;; CRITICAL FIX: Fixed emergency recovery function - now properly transfers from contract to sender
 (define-public (emergency-recover (hash-secret (buff 32)))
-  (match (map-get? swaps hash-secret)
-    swap-data
-    (begin
-      (asserts! (var-get recovery-enabled) ERR_EMERGENCY_NOT_ENABLED)
-      (asserts! (is-eq (get status swap-data) "open") ERR_SWAP_NOT_OPEN)
-      (asserts! (> (- stacks-block-height (get created-at swap-data)) (var-get emergency-timeout)) ERR_EMERGENCY_TOO_EARLY)
-      
-      ;; Only admin or original sender can recover
-      (asserts! (or (is-eq tx-sender (var-get admin)) 
-                    (is-eq tx-sender (get sender swap-data))) ERR_UNAUTHORIZED)
-      
-      ;; Transfer remaining funds to sender
-      (let ((recovery-amount (get remaining-amount swap-data)))
-        (try! (as-contract (stx-transfer? recovery-amount tx-sender (get sender swap-data))))
+  (let ((recoverer tx-sender)) ;; Capture the recoverer's address before as-contract
+    (match (map-get? swaps hash-secret)
+      swap-data
+      (begin
+        (asserts! (var-get recovery-enabled) ERR_EMERGENCY_NOT_ENABLED)
+        (asserts! (is-eq (get status swap-data) "open") ERR_SWAP_NOT_OPEN)
+        (asserts! (> (- stacks-block-height (get created-at swap-data)) (var-get emergency-timeout)) ERR_EMERGENCY_TOO_EARLY)
         
-        (map-set swaps hash-secret (merge swap-data { 
-          status: "recovered",
-          remaining-amount: u0,
-          last-activity: stacks-block-height
-        }))
+        ;; Only admin or original sender can recover
+        (asserts! (or (is-eq recoverer (var-get admin)) 
+                      (is-eq recoverer (get sender swap-data))) ERR_UNAUTHORIZED)
+        
+        ;; Transfer remaining funds to sender
+        (let ((recovery-amount (get remaining-amount swap-data)))
+          (try! (as-contract (stx-transfer? recovery-amount tx-sender (get sender swap-data))))
+          
+          (map-set swaps hash-secret (merge swap-data { 
+            status: "recovered",
+            remaining-amount: u0,
+            last-activity: stacks-block-height
+          }))
+          
+          (print {event: "emergency-recovery", hash: hash-secret, recovered-amount: recovery-amount, recoverer: recoverer})
+          (ok true)
+        )
       )
-      
-      (print {event: "emergency-recovery", hash: hash-secret, recovered-amount: (get remaining-amount swap-data)})
-      (ok true)
+      ERR_SWAP_NOT_FOUND
     )
-    ERR_SWAP_NOT_FOUND
   )
 )
 
